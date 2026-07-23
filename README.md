@@ -177,4 +177,4 @@ Such a binary can be copied to any other Linux machine of the same architecture 
 
 ## License
 
-Use, modify, and distribute freely.
+Use, modify, and distribute freely under GPL-3.0 license.
