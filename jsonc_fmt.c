@@ -5,13 +5,17 @@
  *   - Форматирует (pretty-print) JSON с отступами.
  *   - Понимает комментарии "//" и блочные "/ *" ... "* /" (нестандартное расширение JSON, часто
  *     называемое JSONC) и не выбрасывает их при форматировании.
- *       * Комментарий, который в исходном файле был ЕДИНСТВЕННЫМ содержимым строки
- *         (перед ним и после него на строке нет ничего, кроме пробелов),
- *         считается "одиноким" и при выводе прижимается к началу строки
- *         (колонка 0), на отдельной строке.
+ *       * Комментарий, стоящий на отдельной строке (перед ним нет ничего,
+ *         кроме пробелов), и при этом начинающийся в исходнике РОВНО с
+ *         первого символа строки (столбец 0/1, без единого отступа) —
+ *         прижимается к колонке 0 в результате, на отдельной строке.
+ *       * Любой другой комментарий, стоящий на отдельной строке, но с
+ *         отступом в исходнике — тоже остаётся на отдельной строке, но
+ *         форматируется как обычно: с отступом по текущему уровню
+ *         вложенности (как если бы был указан --align-comments).
  *       * Комментарий, стоящий на строке рядом с кодом (например, после
- *         значения перед запятой), считается "не одиноким" и остаётся
- *         прикреплённым к этой же строке кода, как и было.
+ *         значения перед запятой), остаётся прикреплён к этой же строке
+ *         кода, как и было.
  *   - Валидирует JSON и при синтаксической ошибке печатает в stderr номер
  *     строки и столбца, где она обнаружена, и завершает работу с кодом 1
  *     БЕЗ вывода в stdout.
@@ -19,7 +23,6 @@
  *
  * Сборка:
  *   cc -std=c99 -O2 -Wall -Wextra -o jsonc_fmt jsonc_fmt.c
- *   cc -std=c99 -O2 -Wall -Wextra -static -o jsonc_fmt jsonc_fmt.c
  *
  * Использование:
  *   jsonc_fmt [опции] [файл]
@@ -28,22 +31,29 @@
  * Опции:
  *   -i, --indent N        Ширина отступа пробелами (по умолчанию 2).
  *   -t, --tabs             Использовать табуляцию для отступов вместо пробелов.
- *   -a, --align-comments    Не прижимать "одинокие" комментарии к колонке 0,
- *                           а выравнивать их по текущему уровню вложенности.
+ *   -a, --align-comments    Отступать даже те одинокие комментарии,
+ *                           которые в исходнике начинались ровно с первого
+ *                           символа строки (по умолчанию такие прижимаются
+ *                           к колонке 0).
  *   -f, --fine              Красивый JSON: вставлять пустую строку между
  *                           соседними элементами-объектами/массивами вида
  *                           "},\n{" или "],\n[" (и их сочетаниями) — то есть
  *                           когда после запятой сразу начинается новый
  *                           "{" или "[", а перед запятой был "}" или "]".
- *   -c, --compress          Не разворачивать в несколько строк массивы,
- *                           состоящие только из скалярных значений (строки/
- *                           числа/true/false/null), сколько бы элементов в
- *                           них ни было — например ["geoip:ru","geoip:cn"]
- *                           останется на одной строке.
+ *   -c, --compress          Не разворачивать в несколько строк:
+ *                             * массивы из скаляров (строки/числа/
+ *                               true/false/null) — если элементов не
+ *                               больше 5;
+ *                             * объекты, все значения которых — скаляры —
+ *                               если полей не больше 5 (выводятся как
+ *                               "{ "k": v, "k2": v2 }");
+ *                           в обоих случаях — только если итоговая строка
+ *                           не превышает 150 символов от её начала; иначе
+ *                           структура разворачивается как обычно.
  *
  * Массив, состоящий из ОДНОГО скалярного значения (например ["geoip:ru"]),
  * никогда не разворачивается в несколько строк — это поведение включено
- * всегда, независимо от --compress.
+ * всегда, независимо от --compress и без ограничения по длине строки.
  *   -o, --output FILE      Писать результат в файл вместо stdout.
  *   -s, --stdout            Явно писать результат в stdout (действие по
  *                           умолчанию; имеет приоритет над -o и -w, если
@@ -367,28 +377,22 @@ static void lex_keyword(Lexer *lx, Token *tok) {
     lex_error(lx, sl, sc, "нераспознанный токен возле '%c'", (char)lx_cur(lx));
 }
 
-/* Заглянуть вперёд: есть ли до конца строки (не считая пробелов) что-то ещё? */
-static bool nothing_but_ws_until_eol(Lexer *lx) {
-    size_t p = lx->pos;
-    while (p < lx->len) {
-        char c = lx->src[p];
-        if (c == '\n') return true;
-        if (c == ' ' || c == '\t' || c == '\r') { p++; continue; }
-        return false;
-    }
-    return true; /* EOF */
-}
+
 
 static void lex_comment(Lexer *lx, Token *tok) {
     int sl = lx->line, sc = lx->col;
     const char *start = lx->src + lx->pos;
-    bool before_ok = !lx->line_has_code; /* ничего "кодового" раньше на этой строке */
+    /* "Одинокий" ли комментарий (на отдельной строке, а не приклеенный к
+     * коду) определяется тем, что перед ним на этой строке нет ничего,
+     * кроме пробелов. Внутри этой категории отдельно учитывается, начинался
+     * ли он ровно с первого символа строки (столбец 0/1) — см. sc ниже,
+     * используется при форматировании (f_print_comment). */
+    bool standalone = !lx->line_has_code;
 
     if (lx_cur(lx) == '/' && lx_peek(lx, 1) == '/') {
         lx_advance(lx); lx_advance(lx);
         while (lx_cur(lx) != -1 && lx_cur(lx) != '\n') lx_advance(lx);
         tok->type = T_COMMENT_LINE;
-        tok->standalone = before_ok; /* после // всегда конец строки */
     } else if (lx_cur(lx) == '/' && lx_peek(lx, 1) == '*') {
         lx_advance(lx); lx_advance(lx);
         bool closed = false;
@@ -405,11 +409,11 @@ static void lex_comment(Lexer *lx, Token *tok) {
             return;
         }
         tok->type = T_COMMENT_BLOCK;
-        tok->standalone = before_ok && nothing_but_ws_until_eol(lx);
     } else {
         lex_error(lx, sl, sc, "нераспознанный символ '/'");
         return;
     }
+    tok->standalone = standalone;
     tok->start = start;
     tok->len = (size_t)((lx->src + lx->pos) - start);
     tok->line = sl; tok->col = sc;
@@ -652,11 +656,18 @@ static void f_append_trimmed(Formatter *f, const char *s, size_t len) {
 static void f_print_comment(Formatter *f, Token *t) {
     if (t->standalone) {
         if (!f->at_line_start) f_newline(f);
-        if (f->align_comments) f_write_indent(f);
+        /* Комментарий, начинавшийся в исходнике ровно с первого символа
+         * строки (столбец 0/1, без единого отступа) — прижимается к
+         * колонке 0. Любой другой "одинокий" комментарий (пусть даже с
+         * отступом, но один на строке) форматируется как обычно —
+         * с отступом по текущему уровню вложенности. --align-comments
+         * заставляет всегда отступать, даже комментарии из столбца 0/1. */
+        bool flush_left = !f->align_comments && (t->col <= 1);
+        if (!flush_left) f_write_indent(f);
         f_append_trimmed(f, t->start, t->len);
         f_newline(f);
     } else {
-        /* "не одинокий" — остаётся на той же строке, что и код перед ним */
+        /* приклеен к той же строке, что и код перед ним */
         buf_append_char(&f->out, ' ');
         f_append_trimmed(f, t->start, t->len);
         f->at_line_start = false;
@@ -718,45 +729,165 @@ static bool array_is_flat_scalars(Formatter *f, size_t start_pos, int *out_count
     }
 }
 
-/* Печатает один скалярный токен (строка/число/true/false/null) как есть. */
-static void f_print_scalar(Formatter *f, Token *t) {
+/*
+ * То же самое для объекта: проверяет, что все значения полей — скаляры
+ * (без вложенных объектов/массивов) и внутри нет комментариев. *out_count
+ * получает число полей (0 для пустого объекта).
+ */
+static bool object_is_flat_scalars(Formatter *f, size_t start_pos, int *out_count) {
+    int count = 0;
+    size_t idx = start_pos;
+    for (;;) {
+        if (idx >= f->tl->count) return false;
+        TokType tt = f->tl->items[idx].type;
+        if (tt == T_RBRACE) { *out_count = count; return true; }
+        if (tt == T_STRING) {
+            idx++; /* ключ */
+            if (idx >= f->tl->count || f->tl->items[idx].type != T_COLON) return false;
+            idx++; /* ':' */
+            if (idx >= f->tl->count) return false;
+            TokType vt = f->tl->items[idx].type;
+            if (vt != T_STRING && vt != T_NUMBER && vt != T_TRUE && vt != T_FALSE && vt != T_NULL) {
+                return false; /* вложенный объект/массив или комментарий на месте значения */
+            }
+            idx++;
+            count++;
+            continue;
+        }
+        if (tt == T_COMMA) { idx++; continue; }
+        /* комментарий или что-то неожиданное на месте ключа */
+        return false;
+    }
+}
+
+/* Печатает один скалярный токен (строка/число/true/false/null) в буфер. */
+static void buf_print_scalar(Buf *b, Token *t) {
     switch (t->type) {
         case T_STRING:
         case T_NUMBER:
-            buf_append_n(&f->out, t->start, t->len);
+            buf_append_n(b, t->start, t->len);
             break;
-        case T_TRUE:  buf_append(&f->out, "true");  break;
-        case T_FALSE: buf_append(&f->out, "false"); break;
-        case T_NULL:  buf_append(&f->out, "null");  break;
+        case T_TRUE:  buf_append(b, "true");  break;
+        case T_FALSE: buf_append(b, "false"); break;
+        case T_NULL:  buf_append(b, "null");  break;
         default: break;
     }
 }
+
+/* Сколько символов уже написано на текущей (последней) строке буфера. */
+static size_t f_current_column(Formatter *f) {
+    size_t i = f->out.len;
+    while (i > 0 && f->out.data[i - 1] != '\n') i--;
+    return f->out.len - i;
+}
+
+/*
+ * Строит во временный буфер `tmp` содержимое плоского массива скаляров
+ * (без скобок), начиная с токена сразу после '[' (start_pos). Записывает в
+ * *end_pos индекс токена сразу после ']'. Вызывающая сторона уже убедилась
+ * через array_is_flat_scalars(), что массив действительно плоский.
+ */
+static void build_inline_array(Formatter *f, size_t start_pos, Buf *tmp, size_t *end_pos) {
+    buf_init(tmp);
+    size_t idx = start_pos;
+    bool first = true;
+    while (f->tl->items[idx].type != T_RBRACKET) {
+        if (f->tl->items[idx].type == T_COMMA) { idx++; continue; }
+        if (!first) buf_append(tmp, ", ");
+        buf_print_scalar(tmp, &f->tl->items[idx]);
+        idx++;
+        first = false;
+    }
+    idx++; /* пропускаем ']' */
+    *end_pos = idx;
+}
+
+/* То же самое для объекта: "key": value, "key2": value2, ... (без скобок). */
+static void build_inline_object(Formatter *f, size_t start_pos, Buf *tmp, size_t *end_pos) {
+    buf_init(tmp);
+    size_t idx = start_pos;
+    bool first = true;
+    while (f->tl->items[idx].type != T_RBRACE) {
+        if (f->tl->items[idx].type == T_COMMA) { idx++; continue; }
+        if (!first) buf_append(tmp, ", ");
+        Token *key = &f->tl->items[idx]; idx++;
+        idx++; /* ':' */
+        Token *val = &f->tl->items[idx]; idx++;
+        buf_append_n(tmp, key->start, key->len);
+        buf_append(tmp, ": ");
+        buf_print_scalar(tmp, val);
+        first = false;
+    }
+    idx++; /* пропускаем '}' */
+    *end_pos = idx;
+}
+
+/* Максимум элементов/полей и максимальная длина строки для компактных
+ * структур под --compress (для одиночного скалярного элемента массива
+ * ограничение по длине не действует — см. вызывающий код). */
+#define COMPRESS_MAX_ITEMS 5
+#define COMPRESS_MAX_LINE  150
 
 static void format_container(Formatter *f, TokType open, TokType close, const char *open_s, const char *close_s, bool is_object) {
     buf_append(&f->out, open_s);
     f->at_line_start = false;
     f->pos++; /* пропускаем сам '{' или '[' — он уже был выведен */
+    (void)open;
 
     if (!is_object) {
         int count = 0;
         bool flat = array_is_flat_scalars(f, f->pos, &count);
-        /* Массив с одним скалярным значением никогда не разворачивается.
-         * С опцией --compress не разворачивается ни один "плоский" массив
-         * скаляров, сколько бы в нём ни было элементов. */
-        if (flat && (count <= 1 || f->compress)) {
-            bool first = true;
-            while (f->tl->items[f->pos].type != close) {
-                if (f->tl->items[f->pos].type == T_COMMA) { f->pos++; continue; }
-                if (!first) buf_append(&f->out, ", ");
-                f_print_scalar(f, &f->tl->items[f->pos]);
-                f->pos++;
-                first = false;
-            }
-            f->pos++; /* пропускаем ']' */
+
+        /* Массив с ОДНИМ скалярным значением никогда не разворачивается —
+         * без ограничения по длине строки, независимо от --compress. */
+        if (flat && count <= 1) {
+            Buf tmp; size_t end_pos;
+            build_inline_array(f, f->pos, &tmp, &end_pos);
+            buf_append_n(&f->out, tmp.data, tmp.len);
             buf_append(&f->out, close_s);
             f->at_line_start = false;
-            (void)open;
+            f->pos = end_pos;
+            free(tmp.data);
             return;
+        }
+
+        /* С --compress: массивы из 2..5 скаляров, если итоговая строка не
+         * превышает 150 символов от её начала. */
+        if (flat && f->compress && count >= 2 && count <= COMPRESS_MAX_ITEMS) {
+            Buf tmp; size_t end_pos;
+            build_inline_array(f, f->pos, &tmp, &end_pos);
+            size_t col = f_current_column(f);
+            if (col + tmp.len + 1 /* ']' */ <= COMPRESS_MAX_LINE) {
+                buf_append_n(&f->out, tmp.data, tmp.len);
+                buf_append(&f->out, close_s);
+                f->at_line_start = false;
+                f->pos = end_pos;
+                free(tmp.data);
+                return;
+            }
+            free(tmp.data);
+        }
+    } else if (f->compress) {
+        int count = 0;
+        bool flat = object_is_flat_scalars(f, f->pos, &count);
+        /* С --compress: объекты из 1..5 скалярных полей, если итоговая
+         * строка не превышает 150 символов от её начала. */
+        if (flat && count >= 1 && count <= COMPRESS_MAX_ITEMS) {
+            Buf tmp; size_t end_pos;
+            build_inline_object(f, f->pos, &tmp, &end_pos);
+            size_t col = f_current_column(f);
+            /* "{" уже выведен; добавляем " " + tmp + " }" */
+            if (col + 1 /* ' ' */ + tmp.len + 1 /* ' ' */ + 1 /* '}' */ <= COMPRESS_MAX_LINE) {
+                buf_append_char(&f->out, ' ');
+                buf_append_n(&f->out, tmp.data, tmp.len);
+                buf_append_char(&f->out, ' ');
+                buf_append(&f->out, close_s);
+                f->at_line_start = false;
+                f->pos = end_pos;
+                free(tmp.data);
+                return;
+            }
+            free(tmp.data);
         }
     }
 
@@ -900,15 +1031,18 @@ static void print_usage(FILE *out, const char *prog) {
         "Опции:\n"
         "  -i, --indent N        ширина отступа в пробелах (по умолчанию 2)\n"
         "  -t, --tabs             использовать табуляцию для отступов\n"
-        "  -a, --align-comments   выравнивать одинокие комментарии по уровню\n"
-        "                          вложенности, а не прижимать к колонке 0\n"
+        "  -a, --align-comments   отступать даже те комментарии, что в\n"
+        "                          исходнике начинались ровно с первого\n"
+        "                          символа строки (по умолчанию прижимаются\n"
+        "                          к колонке 0)\n"
         "  -f, --fine              красивый JSON: пустая строка между соседними\n"
         "                          элементами-объектами/массивами (между \"},\"\n"
         "                          и следующим \"{\", и т.п. сочетаниями)\n"
-        "  -c, --compress          не разворачивать массивы из скаляров даже\n"
-        "                          при многих элементах (массив с одним\n"
-        "                          скаляром никогда не разворачивается и без\n"
-        "                          этой опции)\n"
+        "  -c, --compress          не разворачивать массивы/объекты из скаляров,\n"
+        "                          если элементов/полей не больше 5 и строка\n"
+        "                          умещается в 150 символов (массив с ОДНИМ\n"
+        "                          скаляром не разворачивается всегда, без\n"
+        "                          этой опции и без ограничения по длине)\n"
         "  -o, --output FILE      писать результат в файл вместо stdout\n"
         "  -s, --stdout            писать результат в stdout явно (приоритет\n"
         "                          над -o и -w, если указаны вместе)\n"
